@@ -1,0 +1,441 @@
+---
+title: "ESPN FF"
+output: html_document
+---
+
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidymodels)
+library(dplyr)
+library(httr)
+library(reticulate)
+library(plotly)
+library(RPostgres)
+library(DBI)
+
+# Setup Python
+reticulate::py_config()
+```
+
+# Connect to GCP Postgres
+```{r}
+# Read in GCP connection info
+gcp_info <- as.data.frame(read_yaml("gcp_info.yml"))
+gcp_info <- gcp_info %>%
+    mutate(
+        dbname = as.character(dbname),
+        host = as.character(host),
+        port = as.character(port),
+        user = as.character(user),
+        password = as.character(password)
+    )
+
+# Connect to GCP
+con <- dbConnect(
+    RPostgres::Postgres(),
+    dbname=gcp_info$dbname,
+    host=gcp_info$host,
+    port=gcp_info$port,
+    user=gcp_info$user,
+    password=gcp_info$password
+)
+```
+
+# Load Python and Connect to League
+```{python}
+import pandas as pd
+import numpy as np
+from espn_api.football import League
+import requests
+
+# Connect to league
+league = League(league_id=6699721, year=2020)
+# Set current week
+current_week = 11
+```
+
+# Python Functions
+## fixTeams
+```{python}
+# Function to drop annoying team naming conventions
+def fixTeams(teamName):
+    newName = str(teamName).replace('Team(', '')
+    newName = newName.replace(')','')
+    return(newName)
+```
+
+## summarizeTeams
+```{python}
+# Function to convert teams to dataframe
+def summarizeTeams(teams):
+    # Vectors to hold info
+    names = []
+    wins = []
+    losses = []
+    standing = []
+    points_for = []
+    points_against = []
+    points_diff = []
+    
+    # Loop through teams and extract info
+    for team in teams:
+        names.append(fixTeams(team.team_name))
+        wins.append(team.wins)
+        losses.append(team.losses)
+        standing.append(team.standing)
+        points_for.append(team.points_for)
+        points_against.append(team.points_against)
+        points_diff.append(team.points_for - team.points_against)
+    
+    # Create dataframe
+    temp_ = {'name': names, 'wins': wins, 'losses': losses, 'standing': standing, 'points_for': points_for, 'points_against': points_against, 'points_diff': points_diff}
+    teams = pd.DataFrame(temp_)
+    return(teams)
+```
+
+## getPlayerPerformances
+```{python}
+# Function to get players performances
+def getPlayerPerformances(current_week):
+    # Vectors to hold data
+    players = []
+    projected = []
+    points = []
+    pts_diff = []
+    perf_cat = []
+    position = []
+    weeks = []
+    team = []
+    # Iterate over weeks and compound data
+    for i in range(1, current_week):
+      # Get matchups from the week
+      scores = league.box_scores(week=i)
+      # Iterate over each game
+      for game in scores:
+        # Iterate over players on each team and get projected points
+        for player in game.home_lineup:
+          players.append(player.name)
+          projected.append(player.projected_points)
+          points.append(player.points)
+          pts_diff.append(player.points - player.projected_points)
+          perf_cat.append(catPerformance(player.projected_points, player.points))
+          position.append(player.position)
+          weeks.append(i)
+          team.append(fixTeams(game.home_team))
+        for player in game.away_lineup:
+          players.append(player.name)
+          projected.append(player.projected_points)
+          points.append(player.points)
+          pts_diff.append(player.points - player.projected_points)
+          perf_cat.append(catPerformance(player.projected_points, player.points))
+          position.append(player.position)
+          weeks.append(i)
+          team.append(fixTeams(game.away_team))
+
+    # Create dataframe
+    players_ = {'player': players, 'projected': projected, 'points': points, 'pts_diff': pts_diff, 'perf_cat': perf_cat, 'position': position, 'week': weeks, 'team': team}
+    players = pd.DataFrame(players_) 
+    
+    # Return data
+    return(players)
+```
+
+## catPerformance
+```{python}
+# Function to categorize performance
+def catPerformance(proj_pts, pts):
+    # Determine performance
+    if proj_pts == 0:
+        return("NO PROJECTION")
+    elif (pts/proj_pts) > 1.5:
+        return("OVERPERFORMED")
+    elif (pts/proj_pts) < 0.5:
+        return("UNDERPERFORMED")
+    else:
+        return("NEUTRAL")
+```
+
+# General R Code
+## Define Python objects
+```{python}
+team_summary = summarizeTeams(league.teams)
+performances = getPlayerPerformances(current_week)
+```
+
+## Convert to R
+```{r}
+# Convert to dataframes
+team_summary <- as.data.frame(py$team_summary)
+performances <- as.data.frame(py$performances)
+```
+
+# Create Aggregated Data Frames
+## Grouped Performances Table
+Grouping to a player level to get a player's averages for the season. Also counting how many weeks the particular play has been scored, as some players will be less than the season total due to pick-ups/drops in free agency.
+
+### Aggregate Data
+```{r}
+grp_perf <- performances %>%
+  group_by(player) %>%
+  summarise(
+    projected = mean(projected),
+    points = mean(points),
+    pts_diff = mean(pts_diff),
+    weeks = n_distinct(week),
+    ff_team = max(team),
+    position = max(position)
+  )
+```
+
+## FF Team Performances
+Grouping to a positional level by week for each team in the league. Allows for an idea of how a team may be performing over time in particular positions.
+
+### Aggregate Data
+```{r}
+ff_perf <- performances %>%
+  group_by(team, week, position) %>%
+  summarise(
+    projected = mean(projected),
+    points = mean(points),
+    pts_diff = mean(pts_diff),
+    underperformed = n_distinct(player[perf_cat == 'UNDERPERFORMED']),
+    overperformed = n_distinct(player[perf_cat == 'OVERPERFORMED']),
+    neutral = n_distinct(player[perf_cat == 'NEUTRAL'])
+  )
+```
+
+## Position Performances
+Aggregating to a position level by week to see potential trends in position groups over time.
+
+### Aggregate Data
+```{r}
+position_grp <- performances %>%
+  group_by(position, week) %>%
+  summarise(
+    players = n_distinct(player),
+    projected = mean(projected),
+    points = mean(points),
+    pts_diff = mean(pts_diff),
+    underperformed = n_distinct(player[perf_cat == 'UNDERPERFORMED']),
+    overperformed = n_distinct(player[perf_cat == 'OVERPERFORMED']),
+    neutral = n_distinct(player[perf_cat == 'NEUTRAL'])
+  )
+```
+
+## Capture more Python Data
+```{python}
+games = league.box_scores(week = 11)
+player_ids = []
+
+# Extract players from current lineups
+for game in games:
+  for player in game.home_lineup:
+    player_ids.append(player.playerId)
+  for player in game.away_lineup:
+    player_ids.append(player.playerId)
+
+# Extract free agents
+positions = ['QB','RB','WR','TE','K','D/ST']
+fa_players = []
+
+# Iterate over each position
+for position in positions:
+  # Get free agents
+  fa = league.free_agents(week = 11, size = 100, position = position)
+  # Loop over free agents
+  for player in fa:
+    fa_players.append(player.playerId)
+
+# HANDLE PLAYERS ON CURRENT TEAMS
+# Vectors to hold info
+players = []
+team = []
+pos_rank = []
+position = []
+
+# Loop over players
+for player in player_ids:
+  temp = league.player_info(playerId = player)
+  players.append(temp.name)
+  team.append(temp.proTeam)
+  pos_rank.append(temp.posRank)
+  position.append(temp.position)
+  
+# Create dataframe
+rostered_players_ = {'name': players, 'team': team, 'position_rank': pos_rank, 'position': position}
+rostered_players = pd.DataFrame(rostered_players_) 
+  
+# HANDLE FREE AGENTS
+# Two parts: 1) Get summary info 2) Get line-item info
+# SUMMARY INFO
+# Vectors to hold info
+players = []
+team = []
+pos_rank = []
+position = []
+
+# Loop over free agents
+for player in fa_players:
+  temp = league.player_info(playerId = player)
+  players.append(temp.name)
+  team.append(temp.proTeam)
+  pos_rank.append(temp.posRank)
+  position.append(temp.position)
+  
+# Create dataframe
+free_agents_ = {'name': players, 'team': team, 'position_rank': pos_rank, 'position': position}
+free_agents = pd.DataFrame(free_agents_) 
+  
+# LINE-ITEM INFO
+# Vectors to hold info
+players = []
+week = []
+points = []
+
+for player in fa_players:
+  temp = league.player_info(playerId = player)
+  # Grab stats data
+  sts = temp.stats
+  # Iterate over weeks
+  for key in sts.keys():
+    players.append(temp.name)
+    week.append(str(key))
+    points.append(sts[key]['points'])
+    
+# Create dataframe
+fa_line_item_ = {'name': players, 'week': week, 'points': points}
+fa_line_item = pd.DataFrame(fa_line_item_) 
+```
+
+## Convert to R
+```{r}
+# Convert to dataframes
+rostered_players <- as.data.frame(py$rostered_players)
+free_agents <- as.data.frame(py$free_agents)
+fa_line_item <- as.data.frame(py$fa_line_item)
+```
+
+### Filter Data
+```{r}
+# Drop those with free agent lines outside of current week
+fa_line_item <- fa_line_item %>%
+  filter(week < py$current_week)
+```
+
+# Clean Data & Join Tables
+Cleaning up final tables and joining in info before moving to Postgres
+
+## Combine Rostered & Free Agents
+```{r}
+player_list <- rbind(rostered_players, free_agents)
+```
+
+## Player Line-Item Performances
+```{r}
+# Define columns to drop
+drop_cols <- c("team")
+
+# Subset rostered info
+temp_player_list <- player_list %>%
+  select(name, team)
+
+# Drop FF tean from data
+performances <- performances %>%
+  select(-one_of(drop_cols))
+
+# Join in team
+performances <- performances %>%
+  left_join(temp_player_list, by = c("player" = "name"))
+```
+
+## Player Aggregated Performances
+```{r}
+# Define columns to drop
+drop_cols <- c("ff_team")
+
+# Subset rostered info
+temp_player_list <- player_list %>%
+  select(name, team)
+
+# Drop FF tean from data
+grp_perf <- grp_perf %>%
+  select(-one_of(drop_cols))
+
+# Join in team
+grp_perf <- grp_perf %>%
+  left_join(temp_player_list, by = c("player" = "name"))
+```
+
+## Free Agents
+```{r}
+# Join free agent info with line item details
+fa_line_item <- fa_line_item %>%
+  left_join(free_agents, by = c("name"))
+```
+
+## Full Player List
+```{r}
+# Combine free agent list and performances list to create a full list of points performances for players. Data should contain all points scored, but not all points projected (free agents don't show week projections)
+# Subset data
+tmp_fa_line_item <- fa_line_item %>%
+  select(name, week, points, team, position)
+tmp_performances <- performances %>%
+  select(player, points, week, team, position)
+
+# Rename for binding purposes
+names(tmp_performances) <- c("name", "points", "week", "team", "position")
+
+# Bind
+full_players <- rbind(tmp_fa_line_item, tmp_performances)
+```
+
+##################################################################
+##################################################################
+##################################################################
+
+# Push Data to GCP Postgres
+Send all the data into Postgres tables
+
+## Add load dates to tables
+```{r}
+performances <- performances %>% mutate(load_d = lubridate::today())
+full_players <- full_players %>% mutate(load_d = lubridate::today())
+```
+
+## Drop Tables
+```{r}
+# Dropping tables
+dbRemoveTable(con, "performances")
+dbRemoveTable(con, "grouped_performances")
+dbRemoveTable(con, "ff_team_performances")
+dbRemoveTable(con, "position_performances")
+dbRemoveTable(con, "rostered_players")
+dbRemoveTable(con, "free_agents")
+dbRemoveTable(con, "fa_line_item")
+dbRemoveTable(con, "full_players")
+```
+
+## Create Tables
+```{r}
+dbCreateTable(con, "performances", performances)
+dbCreateTable(con, "grouped_performances", grp_perf)
+dbCreateTable(con, "ff_team_performances", ff_perf)
+dbCreateTable(con, "position_performances", position_grp)
+dbCreateTable(con, "rostered_players", rostered_players)
+dbCreateTable(con, "free_agents", free_agents)
+dbCreateTable(con, "fa_line_item", fa_line_item)
+dbCreateTable(con, "full_players", full_players)
+```
+
+## Write Tables
+```{r}
+dbWriteTable(con, "performances", performances, append = TRUE)
+dbWriteTable(con, "grouped_performances", grp_perf, overwrite = TRUE)
+dbWriteTable(con, "ff_team_performances", ff_perf, overwrite = TRUE)
+dbWriteTable(con, "position_performances", position_grp, overwrite = TRUE)
+dbWriteTable(con, "rostered_players", rostered_players, overwrite = TRUE)
+dbWriteTable(con, "free_agents", free_agents, overwrite = TRUE)
+dbWriteTable(con, "fa_line_item", fa_line_item, overwrite = TRUE)
+dbWriteTable(con, "full_players", full_players, append = TRUE)
+```
